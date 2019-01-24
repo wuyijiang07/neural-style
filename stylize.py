@@ -1,21 +1,33 @@
-# Copyright (c) 2015-2017 Anish Athalye. Released under GPLv3.
+# Copyright (c) 2015-2018 Anish Athalye. Released under GPLv3.
+
+import os
+import time
+from collections import OrderedDict
+
+from PIL import Image
+import numpy as np
+import tensorflow as tf
 
 import vgg
 
-import tensorflow as tf
-import numpy as np
-
-from sys import stderr
-
-from PIL import Image
 
 CONTENT_LAYERS = ('relu4_2', 'relu5_2')
 STYLE_LAYERS = ('relu1_1', 'relu2_1', 'relu3_1', 'relu4_1', 'relu5_1')
+
 
 try:
     reduce
 except NameError:
     from functools import reduce
+
+
+def get_loss_vals(loss_store):
+    return OrderedDict((key, val.eval()) for key,val in loss_store.items())
+
+
+def print_progress(loss_vals):
+    for key,val in loss_vals.items():
+        print('{:>13s} {:g}'.format(key + ' loss:', val))
 
 
 def stylize(network, initial, initial_noiseblend, content, styles, preserve_colors, iterations,
@@ -25,11 +37,15 @@ def stylize(network, initial, initial_noiseblend, content, styles, preserve_colo
     """
     Stylize images.
 
-    This function yields tuples (iteration, image); `iteration` is None
-    if this is the final image (the last iteration).  Other tuples are yielded
-    every `checkpoint_iterations` iterations.
+    This function yields tuples (iteration, image, loss_vals) at every
+    iteration. However `image` and `loss_vals` are None by default. Each
+    `checkpoint_iterations`, `image` is not None. Each `print_iterations`,
+    `loss_vals` is not None.
 
-    :rtype: iterator[tuple[int|None,image]]
+    `loss_vals` is a dict with loss values for the current iteration, e.g.
+    ``{'content': 1.23, 'style': 4.56, 'tv': 7.89, 'total': 13.68}``.
+
+    :rtype: iterator[tuple[int,image]]
     """
     shape = (1,) + content.shape
     style_shapes = [(1,) + style.shape for style in styles]
@@ -123,33 +139,63 @@ def stylize(network, initial, initial_noiseblend, content, styles, preserve_colo
                     tv_y_size) +
                 (tf.nn.l2_loss(image[:,:,1:,:] - image[:,:,:shape[2]-1,:]) /
                     tv_x_size))
-        # overall loss
+
+        # total loss
         loss = content_loss + style_loss + tv_loss
+
+        # We use OrderedDict to make sure we have the same order of loss types
+        # (content, tv, style, total) as defined by the initial costruction of
+        # the loss_store dict. This is important for print_progress() and
+        # saving loss_arrs (column order) in the main script.
+        #
+        # Subtle Gotcha (tested with Python 3.5): The syntax
+        # OrderedDict(key1=val1, key2=val2, ...) does /not/ create the same
+        # order since, apparently, it first creates a normal dict with random
+        # order (< Python 3.7) and then wraps that in an OrderedDict. We have
+        # to pass in a data structure which is already ordered. I'd call this a
+        # bug, since both constructor syntax variants result in different
+        # objects. In 3.6, the order is preserved in dict() in CPython, in 3.7
+        # they finally made it part of the language spec. Thank you!
+        loss_store = OrderedDict([('content', content_loss),
+                                  ('style', style_loss),
+                                  ('tv', tv_loss),
+                                  ('total', loss)])
 
         # optimizer setup
         train_step = tf.train.AdamOptimizer(learning_rate, beta1, beta2, epsilon).minimize(loss)
-
-        def print_progress():
-            stderr.write('  content loss: %g\n' % content_loss.eval())
-            stderr.write('    style loss: %g\n' % style_loss.eval())
-            stderr.write('       tv loss: %g\n' % tv_loss.eval())
-            stderr.write('    total loss: %g\n' % loss.eval())
 
         # optimization
         best_loss = float('inf')
         best = None
         with tf.Session() as sess:
             sess.run(tf.global_variables_initializer())
-            stderr.write('Optimization started...\n')
+            print('Optimization started...')
             if (print_iterations and print_iterations != 0):
-                print_progress()
+                print_progress(get_loss_vals(loss_store))
+            iteration_times = []
+            start = time.time()
             for i in range(iterations):
-                stderr.write('Iteration %4d/%4d\n' % (i + 1, iterations))
+                iteration_start = time.time()
+                if i > 0:
+                    elapsed = time.time() - start
+                    # take average of last couple steps to get time per iteration
+                    remaining = np.mean(iteration_times[-10:]) * (iterations - i)
+                    print('Iteration %4d/%4d (%s elapsed, %s remaining)' % (
+                        i + 1,
+                        iterations,
+                        hms(elapsed),
+                        hms(remaining)
+                    ))
+                else:
+                    print('Iteration %4d/%4d' % (i + 1, iterations))
                 train_step.run()
 
                 last_step = (i == iterations - 1)
                 if last_step or (print_iterations and i % print_iterations == 0):
-                    print_progress()
+                    loss_vals = get_loss_vals(loss_store)
+                    print_progress(loss_vals)
+                else:
+                    loss_vals = None
 
                 if (checkpoint_iterations and i % checkpoint_iterations == 0) or last_step:
                     this_loss = loss.eval()
@@ -189,12 +235,13 @@ def stylize(network, initial, initial_noiseblend, content, styles, preserve_colo
 
                         # 5
                         img_out = np.array(Image.fromarray(combined_yuv, 'YCbCr').convert('RGB'))
+                else:
+                    img_out = None
 
+                yield i+1 if last_step else i, img_out, loss_vals
 
-                    yield (
-                        (None if last_step else i),
-                        img_out
-                    )
+                iteration_end = time.time()
+                iteration_times.append(iteration_end - iteration_start)
 
 
 def _tensor_size(tensor):
@@ -209,3 +256,15 @@ def gray2rgb(gray):
     rgb = np.empty((w, h, 3), dtype=np.float32)
     rgb[:, :, 2] = rgb[:, :, 1] = rgb[:, :, 0] = gray
     return rgb
+
+def hms(seconds):
+    seconds = int(seconds)
+    hours = (seconds // (60 * 60))
+    minutes = (seconds // 60) % 60
+    seconds = seconds % 60
+    if hours > 0:
+        return '%d hr %d min' % (hours, minutes)
+    elif minutes > 0:
+        return '%d min %d sec' % (minutes, seconds)
+    else:
+        return '%d sec' % seconds
